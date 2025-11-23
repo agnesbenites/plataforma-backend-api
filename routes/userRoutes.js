@@ -1,14 +1,12 @@
-// backend/routes/userRoutes.js (VERSÃO CORRIGIDA)
+// backend/routes/userRoutes.js (VERSÃO COMMONJS - CORRIGIDA)
 
-// 1. Usar 'import' em vez de 'require'
-import express from "express";
-import { registerUser, loginUser } from "../controllers/userController.js";
-// OBS: Se userController for um arquivo .js, você precisa adicionar a extensão .js aqui.
+const express = require("express");
+const { registerUser, loginUser } = require("../controllers/userController.js");
 
 const router = express.Router();
 
 router.post("/register", registerUser);
 router.post("/login", loginUser);
 
-// 2. Usar 'export default' em vez de 'module.exports'
-export default router;
+// Usar module.exports em vez de export default
+module.exports = router;

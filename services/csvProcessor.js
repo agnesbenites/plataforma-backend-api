@@ -1,8 +1,8 @@
-// backend/services/csvProcessor.js
+// backend/services/csvProcessor.js (CommonJS)
 
-import Papa from "papaparse";
-import fs from "fs";
-import { supabase } from "../utils/supabaseClient"; // Ajuste o caminho conforme o seu projeto
+const Papa = require("papaparse");
+const fs = require("fs");
+const supabase = require("../utils/supabaseClient.js");
 
 // Função para mapear as chaves do CSV (camelCase) para o DB (snake_case)
 const mapKeysToSupabase = (data) => {
@@ -33,7 +33,7 @@ const mapKeysToSupabase = (data) => {
  * @param {string} filePath - Caminho completo para o arquivo CSV temporário.
  * @returns {object} Um objeto com a contagem de produtos inseridos e atualizados.
  */
-export async function processarCsvEImportar(filePath) {
+async function processarCsvEImportar(filePath) {
   let produtosMapeados = [];
 
   // 1. LER e FAZER PARSING DO ARQUIVO CSV
@@ -100,3 +100,5 @@ export async function processarCsvEImportar(filePath) {
     });
   });
 }
+
+module.exports = { processarCsvEImportar };

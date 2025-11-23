@@ -1,8 +1,7 @@
-// backend/utils/supabaseClient.js (Versão Final para o seu setup)
+// backend/utils/supabaseClient.js (CommonJS)
 
-import { createClient } from "@supabase/supabase-js";
-import dotenv from "dotenv";
-dotenv.config();
+const { createClient } = require("@supabase/supabase-js");
+require('dotenv').config();
 
 const supabaseUrl = process.env.SUPABASE_URL;
 
@@ -14,4 +13,4 @@ const supabaseSecretKey = process.env.SUPABASE_ANON_KEY;
 // Para chamadas de servidor (Node.js), usamos a chave secreta de administrador.
 const supabase = createClient(supabaseUrl, supabaseSecretKey);
 
-export default supabase;
+module.exports = supabase;

@@ -1,7 +1,6 @@
 {
-  "name": "backend",
+  "name": "api-backend",
   "version": "1.0.0",
-  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -14,7 +13,8 @@
     "dotenv": "^16.3.1",
     "express": "^4.21.2",
     "multer": "^2.0.2",
-    "papaparse": "^5.5.3"
+    "papaparse": "^5.5.3",
+    "stripe": "^19.3.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
