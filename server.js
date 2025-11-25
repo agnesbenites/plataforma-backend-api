@@ -1,324 +1,148 @@
-const express = require("express");
-const http = require("http");
-const dotenv = require("dotenv");
-const cors = require("cors");
-const chalk = require("chalk");
-const multer = require("multer");
-const fs = require("fs");
-const Stripe = require("stripe");
+const express = require('express');
+const http = require('http'); 
+const dotenv = require('dotenv');
+const cors = require('cors');
 
-const supabase = require("./utils/supabaseClient.js");
-const { processarCsvEImportar } = require("./services/csvProcessor.js");
-
-// === ROTAS ===
-const userRoutes = require("./routes/userRoutes.js");
-const consultantRoutes = require("./routes/consultantRoutes.js");
-const merchantRoutes = require("./routes/merchantRoutes.js");
-const approvalRoutes = require("./routes/approvalRoutes.js");
-const billingRoutes = require("./routes/billingRoutes.js");
+const supabase = require('./utils/supabaseClient'); 
+const userRoutes = require('./routes/userRoutes');
+const debugRoutes = require('./routes/debugRoutes');
 
 // --- CONFIGURAÇÃO INICIAL ---
 dotenv.config();
-const app = express();
-const upload = multer({ dest: "uploads/" });
 
-// --- INICIALIZAÇÃO DO STRIPE ---
-let stripe;
-try {
-  if (process.env.STRIPE_SECRET_KEY) {
-    stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-      apiVersion: '2023-10-16',
-    });
-    console.log(chalk.green("✅ Stripe inicializado com sucesso!"));
-  } else {
-    console.log(chalk.yellow("⚠️  STRIPE_SECRET_KEY não encontrada no .env"));
-  }
-} catch (error) {
-  console.log(chalk.red("❌ Erro ao inicializar Stripe:"), error.message);
-}
+// --- CONFIGURAÇÃO DO STRIPE ---
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-// --- LOG COLORIDO ---
-const log = {
-  info: (msg) => console.log(chalk.cyan(msg)),
-  success: (msg) => console.log(chalk.green(msg)),
-  warning: (msg) => console.log(chalk.yellow(msg)),
-  error: (msg) => console.log(chalk.red(msg)),
-};
-
-// --- TESTE SUPABASE ---
+// --- FUNÇÃO DE TESTE ---
 const testSupabaseConnection = () => {
-  if (supabase) {
-    log.success("✅ Supabase Client inicializado com sucesso!");
-  } else {
-    log.error("❌ Erro: Supabase Client não foi inicializado corretamente.");
-  }
+    console.log('✅ Supabase Client inicializado. Verificação de conexão ocorre nas rotas (Auth).');
 };
 testSupabaseConnection();
 
-// --- TESTE STRIPE ---
-const testStripeConnection = async () => {
-  if (!stripe) {
-    log.warning("⚠️  Stripe não inicializado - verifique STRIPE_SECRET_KEY no .env");
-    return;
-  }
+// --- CONFIGURAÇÃO DO EXPRESS/HTTP ---
+const app = express();
+
+// ⚠️⚠️⚠️ WEBHOOK DO STRIPE DEVE VIR ANTES DO express.json() ⚠️⚠️⚠️
+app.post('/api/webhooks/stripe', express.raw({type: 'application/json'}), async (request, response) => {
+  console.log('🔔 Webhook do Stripe recebido...');
+  
+  const sig = request.headers['stripe-signature'];
+  let event;
 
   try {
-    const balance = await stripe.balance.retrieve();
-    log.success("✅ Conexão com Stripe verificada com sucesso!");
-    log.info(`💰 Moeda disponível: ${balance.available[0]?.currency || 'N/A'}`);
-  } catch (error) {
-    log.error(`❌ Erro na conexão com Stripe: ${error.message}`);
-    
-    if (error.type === 'StripeAuthenticationError') {
-      log.error("🔑 Problema de autenticação - verifique STRIPE_SECRET_KEY");
-    } else if (error.type === 'StripeConnectionError') {
-      log.error("🌐 Problema de conexão com a API do Stripe");
-    } else {
-      log.error(`📋 Tipo de erro: ${error.type}`);
-    }
+    // Verificar assinatura do webhook
+    event = stripe.webhooks.constructEvent(
+      request.body, 
+      sig, 
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+    console.log('✅ Webhook verificado:', event.type);
+  } catch (err) {
+    console.log('❌ Erro de assinatura do webhook:', err.message);
+    return response.status(400).send(`Webhook Error: ${err.message}`);
   }
-};
 
-// --- CONFIGURAÇÃO DO CORS ---
+  // Processar o evento
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      const paymentIntent = event.data.object;
+      console.log('💰 Pagamento bem-sucedido:', paymentIntent.id);
+      console.log('📦 Metadata:', paymentIntent.metadata);
+      
+      // Atualizar venda no Supabase
+      if (paymentIntent.metadata.venda_id) {
+        await atualizarStatusVenda(paymentIntent.metadata.venda_id, 'pago', paymentIntent.id);
+      }
+      break;
+
+    case 'payment_intent.payment_failed':
+      const failedPayment = event.data.object;
+      console.log('❌ Pagamento falhou:', failedPayment.id);
+      
+      if (failedPayment.metadata.venda_id) {
+        await atualizarStatusVenda(failedPayment.metadata.venda_id, 'cancelado', failedPayment.id);
+      }
+      break;
+
+    default:
+      console.log(`⚡ Evento não tratado: ${event.type}`);
+  }
+
+  response.json({received: true});
+});
+
+// Função auxiliar para atualizar Supabase
+async function atualizarStatusVenda(vendaId, status, paymentIntentId = null) {
+  try {
+    const updateData = { 
+      status: status,
+      updated_at: new Date().toISOString()
+    };
+    
+    if (paymentIntentId) {
+      updateData.stripe_payment_intent_id = paymentIntentId;
+    }
+
+    const { data, error } = await supabase
+      .from('vendas')
+      .update(updateData)
+      .eq('id', vendaId);
+
+    if (error) {
+      console.log('❌ Erro ao atualizar venda no Supabase:', error);
+    } else {
+      console.log(`✅ Venda ${vendaId} atualizada para: ${status}`);
+    }
+  } catch (err) {
+    console.log('💥 Erro ao conectar com Supabase:', err);
+  }
+}
+
+// AGORA SIM O express.json() PARA AS OUTRAS ROTAS
 const allowedOrigins = [
-  "http://localhost:5173",
-  "https://plataforma-consultoria-mvp.onrender.com",
-  "https://seu-frontend.onrender.com" // Adicione seu frontend aqui
+    'http://localhost:5173',
+    'https://plataforma-consultoria-mvp.onrender.com'
 ];
 
-app.use(
-  cors({
+app.use(cors({
     origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Acesso CORS não permitido por esta origem"), false);
-      }
-    },
-    credentials: true
-  })
-);
-
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-// --- MIDDLEWARE PARA INJETAR STRIPE NAS ROTAS ---
-app.use((req, res, next) => {
-  req.stripe = stripe;
-  next();
-});
-
-// --- ROTA PRINCIPAL ---
-app.get("/", (req, res) => {
-  const status = {
-    message: "🚀 API da Plataforma de Consultoria de Compras",
-    supabase: "✅ Conectado",
-    stripe: stripe ? "✅ Conectado" : "❌ Não configurado",
-    timestamp: new Date().toISOString()
-  };
-  
-  res.json(status);
-});
-
-// --- ROTA DE STATUS DA API ---
-app.get("/status", async (req, res) => {
-  try {
-    let stripeStatus = "not_configured";
-    
-    if (stripe) {
-      try {
-        await stripe.balance.retrieve();
-        stripeStatus = "connected";
-      } catch (error) {
-        stripeStatus = `error: ${error.type}`;
-      }
+        if (!origin) return callback(null, true); 
+        if (allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Acesso CORS não permitido'), false);
+        }
     }
+}));
 
-    const status = {
-      api: "online",
-      timestamp: new Date().toISOString(),
-      environment: process.env.NODE_ENV || "development",
-      services: {
-        supabase: "connected",
-        stripe: stripeStatus,
-        file_upload: "ready"
-      },
-      endpoints: {
-        users: "/api/users",
-        consultores: "/api/consultores", 
-        lojistas: "/api/lojistas",
-        aprovacoes: "/api/aprovacoes",
-        billing: "/api/vendas/*"
-      }
-    };
+app.use(express.json()); // ⬅️ ESTE VEM DEPOIS DO WEBHOOK
 
-    res.json(status);
-  } catch (error) {
-    res.status(500).json({ error: "Erro ao verificar status" });
-  }
-});
-
-// --- ROTA DE IMPORTAÇÃO CSV ---
-app.post(
-  "/api/lojistas/produtos/importar-csv",
-  upload.single("csvFile"),
-  async (req, res) => {
-    log.info("⬇️ Recebendo arquivo CSV para processamento...");
-
-    if (!req.file) {
-      log.warning("⚠️ Nenhuma arquivo CSV enviado.");
-      return res.status(400).json({
-        error: 'Nenhum arquivo CSV enviado. Verifique se o campo é "csvFile".',
-      });
-    }
-
-    const filePath = req.file.path;
-
-    try {
-      const resultado = await processarCsvEImportar(filePath);
-
-      log.success(
-        `⬆️ Importação concluída! Produtos afetados: ${resultado.totalInseridoOuAtualizado}`
-      );
-
-      res.status(200).json({
-        message: "Importação CSV concluída com sucesso!",
-        ...resultado,
-      });
-    } catch (error) {
-      log.error(`❌ Falha na importação: ${error.message || String(error)}`);
-
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-
-      res.status(500).json({
-        error: "Erro interno ao processar o arquivo CSV.",
-        details: error.message || String(error),
-      });
-    }
-  }
-);
+const server = http.createServer(app); 
 
 // --- ROTAS DA API ---
-app.use("/api/users", userRoutes);
-app.use("/api/consultores", consultantRoutes);
-app.use("/api/lojistas", merchantRoutes);
-app.use("/api/aprovacoes", approvalRoutes);
-app.use("/api", billingRoutes);
-
-// --- ROTA DE TESTE STRIPE ---
-app.get("/api/stripe/test", async (req, res) => {
-  if (!stripe) {
-    return res.status(500).json({
-      error: "Stripe não configurado",
-      message: "Verifique STRIPE_SECRET_KEY no arquivo .env"
-    });
-  }
-
-  try {
-    const balance = await stripe.balance.retrieve();
-    
-    res.json({
-      status: "success",
-      message: "Conexão com Stripe funcionando corretamente",
-      balance: {
-        available: balance.available,
-        pending: balance.pending
-      },
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: "error",
-      error: error.type,
-      message: error.message,
-      details: "Verifique se a chave Stripe está correta"
-    });
-  }
+app.get('/', (req, res) => {
+    if (supabase) {
+        res.send('API de Consultoria de Compras (Supabase) rodando!');
+    } else {
+        res.status(500).send('Erro: Cliente Supabase não inicializado.');
+    }
 });
 
-// --- ROTA SIMPLES DE CHECKOUT (Para teste) ---
-app.post("/api/create-checkout-session", async (req, res) => {
-  if (!stripe) {
-    return res.status(500).json({ error: "Stripe não configurado" });
-  }
-
-  try {
-    const { planId, planName, price, successUrl, cancelUrl } = req.body;
-
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: 'brl',
-            product_data: {
-              name: planName,
-            },
-            unit_amount: price * 100, // Convert to cents
-          },
-          quantity: 1,
-        },
-      ],
-      mode: 'payment',
-      success_url: successUrl || `${req.headers.origin}/success.html`,
-      cancel_url: cancelUrl || `${req.headers.origin}/cancel.html`,
-    });
-
-    res.json({ id: session.id });
-  } catch (error) {
-    console.error('Erro ao criar sessão:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// --- MANIPULAÇÃO DE ERROS ---
-app.use((error, req, res, next) => {
-  console.error('Erro não tratado:', error);
-  res.status(500).json({ 
-    error: 'Erro interno do servidor',
-    message: process.env.NODE_ENV === 'development' ? error.message : 'Algo deu errado'
-  });
-});
-
-// --- ROTA 404 ---
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Rota não encontrada' });
-});
+// Rotas existentes
+app.use('/api/users', userRoutes);
+app.use('/api/debug', debugRoutes);
 
 // --- INICIALIZAÇÃO DO SERVIDOR ---
-const startServer = async (port) => {
-  const server = http.createServer(app);
-  
-  server.listen(port, async () => {
-    log.success(`✅ Servidor rodando na porta ${port}`);
-    log.info(`🌐 Ambiente: ${process.env.NODE_ENV || 'development'}`);
-    log.info(`🗄️  Supabase: ${process.env.SUPABASE_URL ? 'Configurado' : 'Não configurado'}`);
-    log.info(`💳 Stripe: ${process.env.STRIPE_SECRET_KEY ? 'Configurado' : 'Não configurado'}`);
-    
-    await testStripeConnection();
-    
-    log.info("📋 Rotas disponíveis:");
-    log.info("   GET  /status          - Status da API");
-    log.info("   GET  /api/stripe/test - Teste do Stripe");
-    log.info("   POST /api/create-checkout-session - Criar checkout");
-  });
+const PORT = process.env.PORT || 3001; 
 
-  server.on("error", (err) => {
-    if (err.code === "EADDRINUSE") {
-      log.warning(`⚠️ Porta ${port} ocupada. Tentando a próxima...`);
-      startServer(port + 1);
-    } else {
-      log.error(`❌ Erro ao iniciar servidor: ${err.message}`);
-      process.exit(1);
-    }
-  });
-};
+server.listen(PORT, () => { 
+    console.log(`🚀 Servidor HTTP rodando na porta ${PORT}`);
+    console.log(`📋 Debug: http://localhost:${PORT}/api/debug/listar-tabelas`);
+    console.log(`🔔 Webhook: https://plataforma-consultoria-mvp.onrender.com/api/webhooks/stripe`);
+});
 
-const PORT = parseInt(process.env.PORT) || 5000;
-startServer(PORT);
+process.on('unhandledRejection', (err) => {
+    console.error('❌ Erro não tratado:', err);
+});
 
-// Export para testes
-module.exports = { app, stripe };
+module.exports = app;
