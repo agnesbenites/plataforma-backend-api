@@ -30,6 +30,11 @@ const planosRoutes = require('./routes/planosRoutes');
 const produtosRoutes = require('./routes/produtosRoutes');
 const stripeCheckoutRoutes = require('./routes/stripeCheckout.routes');
 
+// 🆕 ROTAS DO CLIENTE MOBILE
+const clienteAuthRoutes = require('./routes/clienteAuth');
+const clienteBuscaRoutes = require('./routes/clienteBusca');
+const clienteAtendimentoRoutes = require('./routes/clienteAtendimento');
+
 // ========== AUTH0 MANAGEMENT ==========
 const { blockUserInAuth0, unblockUserInAuth0 } = require('./utils/auth0Management');
 
@@ -52,6 +57,7 @@ app.use((req, res, next) => {
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
+  'http://localhost:8081',
   'https://plataforma-consultoria-mvp.onrender.com'
 ];
 
@@ -179,6 +185,11 @@ app.use('/api/debug', debugRoutes);
 app.use('/api/planos', planosRoutes);
 app.use('/api/produtos', produtosRoutes);
 app.use('/api/checkout', stripeCheckoutRoutes);
+
+// 🆕 ROTAS DO CLIENTE MOBILE (Público - Sem JWT)
+app.use('/api/cliente', clienteAuthRoutes);
+app.use('/api/cliente', clienteBuscaRoutes);
+app.use('/api/cliente', clienteAtendimentoRoutes);
 
 // ========== ROTAS PROTEGIDAS (COM JWT) ==========
 app.use('/api/users', jwtCheck, userRoutes);
@@ -715,7 +726,7 @@ server.listen(PORT, () => {
   console.log('  GET/POST /api/stripe-connect/*');
   console.log('  GET/POST /api/payment/*');
   
-  console.log('\n🌐 Rotas Públicas (TEMPORÁRIO - PARA TESTE):');
+  console.log('\n🌐 Rotas Públicas:');
   console.log('  GET /');
   console.log('  GET /health');
   console.log('  GET/POST /api/debug/*');
@@ -723,6 +734,8 @@ server.listen(PORT, () => {
   console.log('  GET/POST /api/produtos/*');
   console.log('  GET/POST /api/checkout/*');
   console.log('  POST /api/webhooks/stripe (Stripe Webhook)');
+  console.log('  POST /api/cliente/* (Cliente Mobile) 📱');
+  console.log('    ↳ Auth, Busca, Atendimento (Matching Uber) ✅');
 });
 
 process.on('unhandledRejection', (err) => {

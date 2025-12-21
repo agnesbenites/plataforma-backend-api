@@ -1,0 +1,741 @@
+const express = require('express');
+const http = require('http');
+const dotenv = require('dotenv');
+const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const { auth } = require('express-oauth2-jwt-bearer');
+
+// ========== CONFIGURAÇÃO INICIAL ==========
+dotenv.config();
+
+// ========== MIDDLEWARE JWT AUTH0 ==========
+const jwtCheck = auth({
+  audience: process.env.AUTH0_AUDIENCE,
+  issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
+  tokenSigningAlg: 'RS256'
+});
+
+// ========== UTILS E CLIENTS ==========
+const supabase = require('./utils/supabaseClient');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+// ========== IMPORTAR ROTAS ==========
+const userRoutes = require('./routes/userRoutes');
+const debugRoutes = require('./routes/debugRoutes');
+const billingRoutes = require('./routes/billingRoutes');
+const consultantRoutes = require('./routes/consultantRoutes');
+const stripeConnectRoutes = require('./routes/stripeConnect.routes');
+const paymentRoutes = require('./routes/payment.routes');
+const planosRoutes = require('./routes/planosRoutes');
+const produtosRoutes = require('./routes/produtosRoutes');
+const stripeCheckoutRoutes = require('./routes/stripeCheckout.routes');
+
+// 🆕 ROTAS DO CLIENTE MOBILE
+const clienteAuthRoutes = require('./routes/clienteAuth');
+const clienteBuscaRoutes = require('./routes/clienteBusca');
+
+// ========== AUTH0 MANAGEMENT ==========
+const { blockUserInAuth0, unblockUserInAuth0 } = require('./utils/auth0Management');
+
+// ========== TESTE DE CONEXÃO SUPABASE ==========
+const testSupabaseConnection = () => {
+  console.log('✅ Supabase Client inicializado.');
+};
+testSupabaseConnection();
+
+// ========== CONFIGURAÇÃO DO EXPRESS ==========
+const app = express();
+
+// ========== MIDDLEWARE DE LOG ==========
+app.use((req, res, next) => {
+  console.log(`🌐 ${req.method} ${req.url}`);
+  next();
+});
+
+// ========== CORS ==========
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'https://plataforma-consultoria-mvp.onrender.com'
+];
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true
+}));
+
+// ⚠️ WEBHOOK DO STRIPE - DEVE VIR ANTES DO express.json() ⚠️
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (request, response) => {
+  console.log('🔔 Webhook Stripe recebido...');
+
+  const sig = request.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      request.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+    console.log('✅ Webhook verificado:', event.type);
+  } catch (err) {
+    console.error('❌ Erro de assinatura:', err.message);
+    return response.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      // PAGAMENTOS
+      case 'payment_intent.succeeded':
+        await handlePaymentSucceeded(event.data.object);
+        break;
+
+      case 'payment_intent.payment_failed':
+        await handlePaymentFailed(event.data.object);
+        break;
+
+      // TRANSFERÊNCIAS (COMISSÕES)
+      case 'transfer.created':
+        await handleTransferCreated(event.data.object);
+        break;
+
+      case 'transfer.paid':
+        await handleTransferPaid(event.data.object);
+        break;
+
+      case 'transfer.failed':
+        await handleTransferFailed(event.data.object);
+        break;
+
+      // ASSINATURAS (BLOQUEIO/DESBLOQUEIO)
+      case 'invoice.payment_failed':
+        await handleInvoicePaymentFailed(event.data.object);
+        break;
+
+      case 'invoice.payment_succeeded':
+        await handleInvoicePaymentSucceeded(event.data.object);
+        break;
+
+      case 'customer.subscription.deleted':
+        await handleSubscriptionDeleted(event.data.object);
+        break;
+
+      case 'customer.subscription.updated':
+        await handleSubscriptionUpdated(event.data.object);
+        break;
+
+      case 'customer.subscription.trial_will_end':
+        await handleTrialWillEnd(event.data.object);
+        break;
+
+      // STRIPE CONNECT (CONSULTORES)
+      case 'account.updated':
+        await handleAccountUpdated(event.data.object);
+        break;
+
+      // ✅ NOVOS WEBHOOKS PARA PLANOS
+      case 'checkout.session.completed':
+        await handleCheckoutCompleted(event.data.object);
+        break;
+      
+      case 'customer.subscription.created':
+        await handleSubscriptionCreated(event.data.object);
+        break;
+
+      default:
+        console.log(`⚡ Evento não tratado: ${event.type}`);
+    }
+
+    response.json({ received: true });
+
+  } catch (error) {
+    console.error('💥 Erro ao processar webhook:', error);
+    response.status(500).json({ error: 'Erro ao processar webhook' });
+  }
+});
+
+// ========== MIDDLEWARE JSON ==========
+app.use(express.json());
+app.use(cookieParser());
+
+// ========== ROTAS PÚBLICAS (SEM AUTENTICAÇÃO) ==========
+app.get('/', (req, res) => {
+  res.json({ 
+    message: '🚀 API de Consultoria de Compras',
+    status: 'online',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    services: {
+      supabase: supabase ? 'connected' : 'disconnected',
+      stripe: process.env.STRIPE_SECRET_KEY ? 'configured' : 'not configured',
+      auth0: process.env.AUTH0_DOMAIN ? 'configured' : 'not configured'
+    }
+  });
+});
+
+app.use('/api/debug', debugRoutes);
+app.use('/api/planos', planosRoutes);
+app.use('/api/produtos', produtosRoutes);
+app.use('/api/checkout', stripeCheckoutRoutes);
+
+// 🆕 ROTAS DO CLIENTE MOBILE (Público - Sem JWT)
+app.use('/api/cliente', clienteAuthRoutes);
+app.use('/api/cliente', clienteBuscaRoutes);
+
+// ========== ROTAS PROTEGIDAS (COM JWT) ==========
+app.use('/api/users', jwtCheck, userRoutes);
+app.use('/api', jwtCheck, billingRoutes);
+app.use('/api/consultores', jwtCheck, consultantRoutes);
+app.use('/api/stripe-connect', jwtCheck, stripeConnectRoutes);
+app.use('/api/payment', jwtCheck, paymentRoutes);
+
+// ========== WEBHOOK HANDLERS ==========
+
+async function handlePaymentSucceeded(paymentIntent) {
+  console.log('💰 Pagamento bem-sucedido:', paymentIntent.id);
+  if (paymentIntent.metadata.venda_id) {
+    await atualizarStatusVenda(
+      paymentIntent.metadata.venda_id,
+      'pago',
+      paymentIntent.id
+    );
+    if (paymentIntent.metadata.consultor_id) {
+      await processarComissao(paymentIntent);
+    }
+  }
+}
+
+async function handlePaymentFailed(paymentIntent) {
+  console.log('❌ Pagamento falhou:', paymentIntent.id);
+  if (paymentIntent.metadata.venda_id) {
+    await atualizarStatusVenda(
+      paymentIntent.metadata.venda_id,
+      'cancelado',
+      paymentIntent.id
+    );
+  }
+}
+
+async function atualizarStatusVenda(vendaId, status, paymentIntentId = null) {
+  try {
+    const updateData = { status, atualizado_em: new Date().toISOString() };
+    if (paymentIntentId) updateData.stripe_payment_intent_id = paymentIntentId;
+    if (status === 'pago') updateData.data_pagamento = new Date().toISOString();
+
+    const { error } = await supabase
+      .from('vendas')
+      .update(updateData)
+      .eq('id', vendaId);
+
+    if (error) console.error('❌ Erro ao atualizar venda:', error);
+    else console.log(`✅ Venda ${vendaId} → ${status}`);
+  } catch (err) {
+    console.error('💥 Erro ao conectar Supabase:', err);
+  }
+}
+
+async function processarComissao(paymentIntent) {
+  try {
+    const vendaId = paymentIntent.metadata.venda_id;
+    const consultorId = paymentIntent.metadata.consultor_id;
+    const lojistaId = paymentIntent.metadata.lojista_id;
+    const valorComissao = parseInt(paymentIntent.metadata.commission_amount) / 100;
+    const comissaoPercentual = parseFloat(paymentIntent.metadata.commission_rate);
+
+    console.log(`💰 Registrando comissão: R$ ${valorComissao} (${comissaoPercentual}%)`);
+
+    const { error } = await supabase
+      .from('comissoes')
+      .insert({
+        venda_id: vendaId,
+        consultor_id: consultorId,
+        lojista_id: lojistaId,
+        valor_venda: paymentIntent.amount / 100,
+        percentual_comissao: comissaoPercentual,
+        valor_comissao: valorComissao,
+        stripe_payment_intent_id: paymentIntent.id,
+        stripe_charge_id: paymentIntent.latest_charge,
+        status: 'pendente',
+        data_venda: new Date().toISOString(),
+        criado_em: new Date().toISOString()
+      });
+
+    if (error) console.error('❌ Erro ao registrar comissão:', error);
+    else console.log('✅ Comissão registrada!');
+  } catch (error) {
+    console.error('💥 Erro ao processar comissão:', error);
+  }
+}
+
+async function handleTransferCreated(transfer) {
+  console.log('💸 Transfer criada:', transfer.id);
+  await supabase
+    .from('comissoes')
+    .update({
+      stripe_transfer_id: transfer.id,
+      status: 'processando',
+      atualizado_em: new Date().toISOString()
+    })
+    .eq('stripe_payment_intent_id', transfer.source_transaction);
+}
+
+async function handleTransferPaid(transfer) {
+  console.log('✅ Transfer paga:', transfer.amount / 100);
+  await supabase
+    .from('comissoes')
+    .update({
+      status: 'pago',
+      data_pagamento: new Date().toISOString(),
+      atualizado_em: new Date().toISOString()
+    })
+    .eq('stripe_transfer_id', transfer.id);
+}
+
+async function handleTransferFailed(transfer) {
+  console.error('❌ Transfer falhou:', transfer.id);
+  await supabase
+    .from('comissoes')
+    .update({
+      status: 'cancelado',
+      observacoes: 'Transferência falhou',
+      atualizado_em: new Date().toISOString()
+    })
+    .eq('stripe_transfer_id', transfer.id);
+}
+
+async function handleInvoicePaymentFailed(invoice) {
+  const customerId = invoice.customer;
+  const attemptCount = invoice.attempt_count || 1;
+  console.log(`📊 Tentativa ${attemptCount} de pagamento falhou`);
+
+  const { data: lojista, error } = await supabase
+    .from('lojistas')
+    .select('*')
+    .eq('stripe_customer_id', customerId)
+    .single();
+
+  if (error || !lojista) {
+    console.error('❌ Lojista não encontrado');
+    return;
+  }
+
+  if (attemptCount >= 3) {
+    console.log('🔒 Bloqueando lojista:', lojista.email);
+    try {
+      if (lojista.auth0_id) {
+        await blockUserInAuth0(lojista.auth0_id, 'Pagamento não realizado');
+      }
+      await supabase
+        .from('lojistas')
+        .update({
+          status: 'bloqueado',
+          motivo_bloqueio: 'Falta de pagamento',
+          data_bloqueio: new Date().toISOString(),
+          ultimo_pagamento_falhou: true,
+          tentativas_pagamento: attemptCount,
+          atualizado_em: new Date().toISOString()
+        })
+        .eq('id', lojista.id);
+      console.log('✅ Lojista bloqueado');
+    } catch (blockError) {
+      console.error('❌ Erro ao bloquear:', blockError);
+    }
+  } else {
+    await supabase
+      .from('lojistas')
+      .update({
+        ultimo_pagamento_falhou: true,
+        tentativas_pagamento: attemptCount,
+        atualizado_em: new Date().toISOString()
+      })
+      .eq('id', lojista.id);
+  }
+}
+
+async function handleInvoicePaymentSucceeded(invoice) {
+  const customerId = invoice.customer;
+  console.log('✅ Pagamento realizado');
+
+  const { data: lojista, error } = await supabase
+    .from('lojistas')
+    .select('*')
+    .eq('stripe_customer_id', customerId)
+    .single();
+
+  if (error || !lojista) {
+    console.error('❌ Lojista não encontrado');
+    return;
+  }
+
+  try {
+    if (lojista.status === 'bloqueado' && lojista.auth0_id) {
+      console.log('🔓 Desbloqueando lojista:', lojista.email);
+      await unblockUserInAuth0(lojista.auth0_id);
+    }
+
+    await supabase
+      .from('lojistas')
+      .update({
+        status: 'ativo',
+        motivo_bloqueio: null,
+        data_bloqueio: null,
+        ultimo_pagamento_falhou: false,
+        tentativas_pagamento: 0,
+        ultimo_pagamento_em: new Date().toISOString(),
+        atualizado_em: new Date().toISOString()
+      })
+      .eq('id', lojista.id);
+
+    console.log('✅ Lojista desbloqueado');
+  } catch (error) {
+    console.error('❌ Erro ao desbloquear:', error);
+  }
+}
+
+async function handleSubscriptionDeleted(subscription) {
+  const customerId = subscription.customer;
+  console.log('🗑️ Assinatura cancelada');
+
+  const { data: lojista, error } = await supabase
+    .from('lojistas')
+    .select('*')
+    .eq('stripe_customer_id', customerId)
+    .single();
+
+  if (error || !lojista) return;
+
+  try {
+    if (lojista.auth0_id) {
+      await blockUserInAuth0(lojista.auth0_id, 'Assinatura cancelada');
+    }
+
+    await supabase
+      .from('lojistas')
+      .update({
+        status: 'cancelado',
+        motivo_bloqueio: 'Assinatura cancelada',
+        data_bloqueio: new Date().toISOString(),
+        stripe_subscription_id: null,
+        atualizado_em: new Date().toISOString()
+      })
+      .eq('id', lojista.id);
+
+    console.log('✅ Lojista bloqueado por cancelamento');
+  } catch (error) {
+    console.error('❌ Erro:', error);
+  }
+}
+
+async function handleSubscriptionUpdated(subscription) {
+  const customerId = subscription.customer;
+  const status = subscription.status;
+  const priceId = subscription.items.data[0]?.price?.id;
+  console.log(`🔄 Assinatura atualizada: ${status}`);
+
+  const { data: lojista, error } = await supabase
+    .from('lojistas')
+    .select('*')
+    .eq('stripe_customer_id', customerId)
+    .single();
+
+  if (error || !lojista) return;
+
+  try {
+    // Verificar se é uma assinatura de plano ou adicional
+    const { data: plano } = await supabase
+      .from('planos')
+      .select('*')
+      .eq('stripe_price_id', priceId)
+      .single();
+
+    if (plano) {
+      // É atualização de plano principal
+      if (status === 'active' && lojista.status === 'bloqueado') {
+        console.log('🔓 Desbloqueando lojista');
+        if (lojista.auth0_id) {
+          await unblockUserInAuth0(lojista.auth0_id);
+        }
+      }
+
+      await supabase
+        .from('lojistas')
+        .update({
+          status: status === 'active' ? 'ativo' : lojista.status,
+          motivo_bloqueio: status === 'active' ? null : lojista.motivo_bloqueio,
+          data_bloqueio: status === 'active' ? null : lojista.data_bloqueio,
+          dias_vencidos: 0,
+          stripe_subscription_status: status,
+          stripe_price_id: priceId,
+          plano_id: plano.id,
+          atualizado_em: new Date().toISOString()
+        })
+        .eq('id', lojista.id);
+
+      console.log('✅ Plano do lojista atualizado:', plano.nome);
+    } else {
+      // É atualização de adicional
+      await supabase
+        .from('assinaturas_adicionais')
+        .update({
+          status: status === 'active' ? 'active' : status === 'canceled' ? 'canceled' : 'past_due',
+          data_cancelamento: status === 'canceled' ? new Date().toISOString() : null,
+          atualizado_em: new Date().toISOString()
+        })
+        .eq('stripe_subscription_id', subscription.id);
+
+      console.log('✅ Adicional atualizado');
+      
+      // Recalcular limites
+      await atualizarLimitesComAdicionais(lojista.id);
+    }
+
+  } catch (error) {
+    console.error('❌ Erro:', error);
+  }
+}
+
+async function handleTrialWillEnd(subscription) {
+  const customerId = subscription.customer;
+  const diasRestantes = Math.ceil(
+    (subscription.trial_end * 1000 - Date.now()) / (1000 * 60 * 60 * 24)
+  );
+  console.log(`⏰ Trial terminando em ${diasRestantes} dias`);
+
+  const { data: lojista } = await supabase
+    .from('lojistas')
+    .select('*')
+    .eq('stripe_customer_id', customerId)
+    .single();
+
+  if (lojista) {
+    console.log(`📧 Email deveria ser enviado para: ${lojista.email}`);
+  }
+}
+
+async function handleAccountUpdated(account) {
+  console.log('🔄 Conta Connect atualizada:', account.id);
+  const isActive = account.charges_enabled && account.payouts_enabled;
+  const status = isActive ? 'active' : 'restricted';
+
+  const { error } = await supabase
+    .from('consultores')
+    .update({
+      stripe_account_status: status,
+      stripe_charges_enabled: account.charges_enabled,
+      stripe_payouts_enabled: account.payouts_enabled,
+      stripe_onboarding_complete: isActive,
+      atualizado_em: new Date().toISOString()
+    })
+    .eq('stripe_account_id', account.id);
+
+  if (error) {
+    console.error('❌ Erro ao atualizar consultor:', error);
+  } else {
+    console.log(`✅ Consultor atualizado → ${status}`);
+  }
+}
+
+// ========== NOVOS WEBHOOK HANDLERS PARA PLANOS ==========
+
+async function handleCheckoutCompleted(session) {
+  console.log('🎉 Checkout completado:', session.id);
+  const metadata = session.metadata;
+  const tipoCheckout = metadata.tipo_checkout;
+
+  try {
+    if (tipoCheckout === 'upgrade_plano') {
+      const { error } = await supabase
+        .from('lojistas')
+        .update({
+          plano_id: metadata.plano_id,
+          status_assinatura: 'active',
+          stripe_subscription_id: session.subscription,
+          atualizado_em: new Date().toISOString()
+        })
+        .eq('id', metadata.lojista_id);
+
+      if (error) {
+        console.error('❌ Erro ao atualizar plano:', error);
+      } else {
+        console.log(`✅ Lojista ${metadata.lojista_id} → Plano ${metadata.plano_nome}`);
+      }
+    }
+
+    else if (tipoCheckout === 'adicional') {
+      const { error } = await supabase
+        .from('assinaturas_adicionais')
+        .insert({
+          lojista_id: metadata.lojista_id,
+          produto_stripe_id: metadata.produto_stripe_id,
+          stripe_subscription_id: session.subscription,
+          quantidade: parseInt(metadata.quantidade) || 1,
+          status: 'active',
+          data_inicio: new Date().toISOString()
+        });
+
+      if (error) {
+        console.error('❌ Erro ao registrar adicional:', error);
+      } else {
+        console.log(`✅ Adicional ativado: ${metadata.tipo_produto}`);
+        await atualizarLimitesComAdicionais(metadata.lojista_id);
+      }
+    }
+
+    else if (tipoCheckout === 'campanha_marketing') {
+      const { data: campanha, error } = await supabase
+        .from('campanhas_marketing')
+        .insert({
+          lojista_id: metadata.lojista_id,
+          stripe_payment_intent_id: session.payment_intent,
+          dias_comprados: parseInt(metadata.dias_comprados),
+          valor_pago: session.amount_total / 100,
+          alcance_km: parseInt(metadata.alcance_km),
+          status: 'configurando'
+        })
+        .select()
+        .single();
+
+      if (error) {
+        console.error('❌ Erro ao criar campanha:', error);
+      } else {
+        console.log(`✅ Campanha criada: ${campanha.id} - ${metadata.dias_comprados} dias`);
+      }
+    }
+
+  } catch (error) {
+    console.error('💥 Erro ao processar checkout:', error);
+  }
+}
+
+async function handleSubscriptionCreated(subscription) {
+  console.log('📝 Assinatura criada:', subscription.id);
+  const lojistaId = subscription.metadata.lojista_id;
+  const produtoStripeId = subscription.metadata.produto_stripe_id;
+
+  if (!lojistaId || !produtoStripeId) return;
+
+  try {
+    const subscriptionItem = subscription.items.data[0];
+
+    const { error } = await supabase
+      .from('assinaturas_adicionais')
+      .update({
+        stripe_subscription_item_id: subscriptionItem.id,
+        atualizado_em: new Date().toISOString()
+      })
+      .eq('stripe_subscription_id', subscription.id)
+      .eq('lojista_id', lojistaId);
+
+    if (error) {
+      console.error('❌ Erro ao atualizar subscription_item_id:', error);
+    } else {
+      console.log('✅ Subscription item ID salvo');
+    }
+
+  } catch (error) {
+    console.error('💥 Erro ao processar assinatura:', error);
+  }
+}
+
+async function atualizarLimitesComAdicionais(lojistaId) {
+  try {
+    const { data: adicionais, error: addError } = await supabase
+      .from('assinaturas_adicionais')
+      .select('produto_stripe_id, quantidade, produtos_stripe(*)')
+      .eq('lojista_id', lojistaId)
+      .eq('status', 'active');
+
+    if (addError) {
+      console.error('❌ Erro ao buscar adicionais:', addError);
+      return;
+    }
+
+    let totalPacotesAdicionais = 0;
+    
+    for (const adicional of adicionais) {
+      const produto = adicional.produtos_stripe;
+      
+      if (produto && produto.tipo === 'adicional_basico') {
+        totalPacotesAdicionais += adicional.quantidade;
+      }
+    }
+
+    const { error: updateError } = await supabase
+      .from('uso_lojista')
+      .update({
+        pacotes_adicionais_ativos: totalPacotesAdicionais,
+        atualizado_em: new Date().toISOString()
+      })
+      .eq('lojista_id', lojistaId);
+
+    if (updateError) {
+      console.error('❌ Erro ao atualizar limites:', updateError);
+    } else {
+      console.log(`✅ Limites atualizados: ${totalPacotesAdicionais} pacotes adicionais`);
+    }
+
+  } catch (error) {
+    console.error('💥 Erro ao atualizar limites:', error);
+  }
+}
+
+// ========== MIDDLEWARE DE ERRO PARA JWT ==========
+app.use((err, req, res, next) => {
+  if (err.name === 'UnauthorizedError') {
+    console.error('❌ Token JWT inválido:', err.message);
+    return res.status(401).json({ 
+      error: 'Token inválido ou expirado',
+      code: 'INVALID_TOKEN'
+    });
+  }
+  next(err);
+});
+
+// ========== ROTA 404 ==========
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Rota não encontrada' });
+});
+
+// ========== INICIALIZAÇÃO DO SERVIDOR ==========
+const server = http.createServer(app);
+const PORT = process.env.PORT || 5000;
+
+server.listen(PORT, () => {
+  console.log(`
+╔═══════════════════════════════════════════════════════╗
+║   🚀 Servidor rodando na porta ${PORT}                  ║
+║   🔐 Autenticação: Auth0 JWT                         ║
+║   📡 Audience: ${process.env.AUTH0_AUDIENCE}         ║
+║   🌐 Domínio: ${process.env.AUTH0_DOMAIN}            ║
+║   ❤️  Health: http://localhost:${PORT}/health         ║
+╚═══════════════════════════════════════════════════════╝
+  `);
+
+  console.log('\n🔐 Rotas Protegidas (requerem token JWT):');
+  console.log('  GET/POST /api/users/*');
+  console.log('  GET/POST /api/consultores/*');
+  console.log('  GET/POST /api/stripe-connect/*');
+  console.log('  GET/POST /api/payment/*');
+  
+  console.log('\n🌐 Rotas Públicas (TEMPORÁRIO - PARA TESTE):');
+  console.log('  GET /');
+  console.log('  GET /health');
+  console.log('  GET/POST /api/debug/*');
+  console.log('  GET/POST /api/planos/*');
+  console.log('  GET/POST /api/produtos/*');
+  console.log('  GET/POST /api/checkout/*');
+  console.log('  POST /api/webhooks/stripe (Stripe Webhook)');
+  console.log('  POST /api/cliente/* (Cliente Mobile) 📱');
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('❌ Erro não tratado:', err);
+});
+
+module.exports = app;

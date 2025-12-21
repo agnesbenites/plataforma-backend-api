@@ -9,6 +9,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.84.0",
     "axios": "^1.13.2",
+    "bcrypt": "^6.0.0",
     "chalk": "^5.6.2",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
@@ -22,6 +23,7 @@
     "papaparse": "^5.5.3",
     "path": "^0.12.7",
     "stripe": "^19.3.1",
+    "twilio": "^5.11.1",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
