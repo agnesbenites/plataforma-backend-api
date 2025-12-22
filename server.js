@@ -29,12 +29,16 @@ const paymentRoutes = require('./routes/payment.routes');
 const planosRoutes = require('./routes/planosRoutes');
 const produtosRoutes = require('./routes/produtosRoutes');
 const stripeCheckoutRoutes = require('./routes/stripeCheckout.routes');
+const chatRoutes = require('./routes/chat');
 
 // 🆕 ROTAS DO CLIENTE MOBILE
 const clienteAuthRoutes = require('./routes/clienteAuth');
 const clienteBuscaRoutes = require('./routes/clienteBusca');
 const clienteAtendimentoRoutes = require('./routes/clienteAtendimento');
 
+// 🆕 CRON JOB DE VERIFICAÇÃO DE PAGAMENTOS
+const { iniciarVerificacaoDePagamentos } = require('./jobs/checkPayments');
+const { iniciarCronExclusoes } = require('./jobs/processarExclusoes');
 // ========== AUTH0 MANAGEMENT ==========
 const { blockUserInAuth0, unblockUserInAuth0 } = require('./utils/auth0Management');
 
@@ -185,6 +189,7 @@ app.use('/api/debug', debugRoutes);
 app.use('/api/planos', planosRoutes);
 app.use('/api/produtos', produtosRoutes);
 app.use('/api/checkout', stripeCheckoutRoutes);
+app.use('/api/chat', chatRoutes);
 
 // 🆕 ROTAS DO CLIENTE MOBILE (Público - Sem JWT)
 app.use('/api/cliente', clienteAuthRoutes);
@@ -450,7 +455,6 @@ async function handleSubscriptionUpdated(subscription) {
   if (error || !lojista) return;
 
   try {
-    // Verificar se é uma assinatura de plano ou adicional
     const { data: plano } = await supabase
       .from('planos')
       .select('*')
@@ -458,7 +462,6 @@ async function handleSubscriptionUpdated(subscription) {
       .single();
 
     if (plano) {
-      // É atualização de plano principal
       if (status === 'active' && lojista.status === 'bloqueado') {
         console.log('🔓 Desbloqueando lojista');
         if (lojista.auth0_id) {
@@ -482,7 +485,6 @@ async function handleSubscriptionUpdated(subscription) {
 
       console.log('✅ Plano do lojista atualizado:', plano.nome);
     } else {
-      // É atualização de adicional
       await supabase
         .from('assinaturas_adicionais')
         .update({
@@ -493,8 +495,6 @@ async function handleSubscriptionUpdated(subscription) {
         .eq('stripe_subscription_id', subscription.id);
 
       console.log('✅ Adicional atualizado');
-      
-      // Recalcular limites
       await atualizarLimitesComAdicionais(lojista.id);
     }
 
@@ -544,8 +544,6 @@ async function handleAccountUpdated(account) {
   }
 }
 
-// ========== NOVOS WEBHOOK HANDLERS PARA PLANOS ==========
-
 async function handleCheckoutCompleted(session) {
   console.log('🎉 Checkout completado:', session.id);
   const metadata = session.metadata;
@@ -569,7 +567,6 @@ async function handleCheckoutCompleted(session) {
         console.log(`✅ Lojista ${metadata.lojista_id} → Plano ${metadata.plano_nome}`);
       }
     }
-
     else if (tipoCheckout === 'adicional') {
       const { error } = await supabase
         .from('assinaturas_adicionais')
@@ -589,7 +586,6 @@ async function handleCheckoutCompleted(session) {
         await atualizarLimitesComAdicionais(metadata.lojista_id);
       }
     }
-
     else if (tipoCheckout === 'campanha_marketing') {
       const { data: campanha, error } = await supabase
         .from('campanhas_marketing')
@@ -610,7 +606,6 @@ async function handleCheckoutCompleted(session) {
         console.log(`✅ Campanha criada: ${campanha.id} - ${metadata.dias_comprados} dias`);
       }
     }
-
   } catch (error) {
     console.error('💥 Erro ao processar checkout:', error);
   }
@@ -640,7 +635,6 @@ async function handleSubscriptionCreated(subscription) {
     } else {
       console.log('✅ Subscription item ID salvo');
     }
-
   } catch (error) {
     console.error('💥 Erro ao processar assinatura:', error);
   }
@@ -682,13 +676,11 @@ async function atualizarLimitesComAdicionais(lojistaId) {
     } else {
       console.log(`✅ Limites atualizados: ${totalPacotesAdicionais} pacotes adicionais`);
     }
-
   } catch (error) {
     console.error('💥 Erro ao atualizar limites:', error);
   }
 }
 
-// ========== MIDDLEWARE DE ERRO PARA JWT ==========
 app.use((err, req, res, next) => {
   if (err.name === 'UnauthorizedError') {
     console.error('❌ Token JWT inválido:', err.message);
@@ -700,7 +692,6 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ========== ROTA 404 ==========
 app.use('*', (req, res) => {
   res.status(404).json({ error: 'Rota não encontrada' });
 });
@@ -708,6 +699,10 @@ app.use('*', (req, res) => {
 // ========== INICIALIZAÇÃO DO SERVIDOR ==========
 const server = http.createServer(app);
 const PORT = process.env.PORT || 5000;
+
+// 🆕 INICIAR CRON JOB ANTES DO SERVIDOR SUBIR
+iniciarVerificacaoDePagamentos();
+iniciarCronExclusoes();
 
 server.listen(PORT, () => {
   console.log(`
@@ -717,6 +712,8 @@ server.listen(PORT, () => {
 ║   📡 Audience: ${process.env.AUTH0_AUDIENCE}         ║
 ║   🌐 Domínio: ${process.env.AUTH0_DOMAIN}            ║
 ║   ❤️  Health: http://localhost:${PORT}/health         ║
+║   📧 Sistema de Notificações: ATIVO                  ║
+║   ⏰ Cron Job: Verificações às 8h da manhã           ║
 ╚═══════════════════════════════════════════════════════╝
   `);
 
