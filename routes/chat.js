@@ -1,11 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { createClient } = require('@supabase/supabase-js');
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
+const supabase = require('../utils/supabaseClient'); // ✅ Usar cliente centralizado
 
 // Função auxiliar para registrar mensagem na auditoria
 async function registrarAuditoria(usuario1_id, usuario2_id, mensagem, tipo = 'texto', metadata = null) {
@@ -19,7 +14,6 @@ async function registrarAuditoria(usuario1_id, usuario2_id, mensagem, tipo = 'te
         tipo,
         metadata
       });
-    
     if (error) {
       console.error('Erro ao registrar auditoria:', error);
     }
