@@ -8,13 +8,6 @@ const { auth } = require('express-oauth2-jwt-bearer');
 // ========== CONFIGURAÇÃO INICIAL ==========
 dotenv.config();
 
-// ========== MIDDLEWARE JWT AUTH0 ==========
-const jwtCheck = auth({
-  audience: process.env.AUTH0_AUDIENCE,
-  issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
-  tokenSigningAlg: 'RS256'
-});
-
 // ========== UTILS E CLIENTS ==========
 const supabase = require('./utils/supabaseClient');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
