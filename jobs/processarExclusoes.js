@@ -2,7 +2,6 @@
 
 const cron = require('node-cron');
 const supabase = require('../utils/supabaseClient');
-const { deleteUserInAuth0 } = require('../utils/auth0Management');
 const { enviarEmail } = require('../utils/notificationService');
 
 // ============================================
@@ -77,16 +76,6 @@ async function executarExclusao(exclusao) {
       await anonimizarDadosLojista(usuario_id);
     } else if (tipo_usuario === 'consultor') {
       await anonimizarDadosConsultor(usuario_id);
-    }
-
-    // 4. Excluir do Auth0
-    if (usuario.auth0_id) {
-      try {
-        await deleteUserInAuth0(usuario.auth0_id);
-        console.log(`✅ Usuário excluído do Auth0: ${usuario.auth0_id}`);
-      } catch (auth0Error) {
-        console.error('❌ Erro ao excluir do Auth0:', auth0Error);
-      }
     }
 
     // 5. Excluir do banco de dados
