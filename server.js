@@ -22,6 +22,7 @@ const debugRoutes = require('./routes/debugRoutes');
 const billingRoutes = require('./routes/billingRoutes');
 const consultantRoutes = require('./routes/consultantRoutes');
 const stripeConnectRoutes = require('./routes/stripeConnect.routes');
+const stripeRoutes = require('./routes/stripeRoutes');
 const paymentRoutes = require('./routes/payment.routes');
 const planosRoutes = require('./routes/planosRoutes');
 const produtosRoutes = require('./routes/produtosRoutes');
@@ -96,7 +97,9 @@ app.use(cors({
   credentials: true
 }));
 
-// ⚠️ WEBHOOK DO STRIPE - DEVE VIR ANTES DO express.json() ⚠️
+// ⚠️ WEBHOOKS DO STRIPE - DEVEM VIR ANTES DO express.json() ⚠️
+
+// Webhook antigo (assinaturas)
 app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (request, response) => {
   console.log('🔔 Webhook Stripe recebido...');
   const sig = request.headers['stripe-signature'];
@@ -165,8 +168,94 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
   }
 });
 
+// 🆕 Webhook novo (payment links)
+app.post('/api/stripe/webhook-payments', express.raw({ type: 'application/json' }), async (request, response) => {
+  console.log('🔔 Webhook Payment Links recebido...');
+  const sig = request.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET_PAYMENTS;
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(request.body, sig, webhookSecret);
+    console.log('✅ Webhook verificado:', event.type);
+  } catch (err) {
+    console.error('❌ Erro de assinatura webhook payments:', err.message);
+    return response.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed':
+        const session = event.data.object;
+        const pedidoId = session.metadata.pedido_id;
+        
+        console.log(`✅ Pagamento confirmado para pedido: ${pedidoId}`);
+        
+        await supabase
+          .from('pedidos')
+          .update({
+            status_pagamento: 'pago',
+            status_separacao: 'Pronto para pagamento',
+            ultima_atualizacao: new Date().toISOString()
+          })
+          .eq('id', pedidoId);
+        
+        break;
+        
+      case 'payment_intent.succeeded':
+        const paymentIntent = event.data.object;
+        const pedidoIdSuccess = paymentIntent.metadata.pedido_id;
+        
+        if (pedidoIdSuccess) {
+          console.log(`✅ PaymentIntent succeeded: ${pedidoIdSuccess}`);
+          
+          await supabase
+            .from('pedidos')
+            .update({
+              status_pagamento: 'pago',
+              status_separacao: 'Pronto para pagamento',
+              ultima_atualizacao: new Date().toISOString()
+            })
+            .eq('id', pedidoIdSuccess);
+        }
+        break;
+        
+      case 'payment_intent.payment_failed':
+        const failedIntent = event.data.object;
+        const pedidoIdFailed = failedIntent.metadata.pedido_id;
+        
+        console.log(`❌ Pagamento falhou: ${pedidoIdFailed}`);
+        
+        if (pedidoIdFailed) {
+          await supabase
+            .from('pedidos')
+            .update({
+              status_pagamento: 'falhou',
+              ultima_atualizacao: new Date().toISOString()
+            })
+            .eq('id', pedidoIdFailed);
+        }
+        break;
+        
+      default:
+        console.log(`⚡ Evento payment não tratado: ${event.type}`);
+    }
+    
+    response.json({ received: true });
+  } catch (error) {
+    console.error('💥 Erro ao processar webhook payments:', error);
+    response.status(500).json({ error: 'Erro ao processar webhook' });
+  }
+});
+
 // ========== MIDDLEWARE JSON ==========
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/stripe/webhook-payments') {
+    next(); // Não parsear webhooks
+  } else {
+    express.json()(req, res, next);
+  }
+});
 app.use(cookieParser());
 
 // ========== ROTAS PÚBLICAS ==========
@@ -206,6 +295,7 @@ app.use('/api/users', supabaseAuth, userRoutes);
 app.use('/api/billing', supabaseAuth, billingRoutes);
 app.use('/api/consultores', supabaseAuth, consultantRoutes);
 app.use('/api/stripe-connect', supabaseAuth, stripeConnectRoutes);
+app.use('/api/stripe', stripeRoutes);
 app.use('/api/payment', supabaseAuth, paymentRoutes);
 
 // ========== WEBHOOK HANDLERS (LÓGICA DE NEGÓCIO) ==========

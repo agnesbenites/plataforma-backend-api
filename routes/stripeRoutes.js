@@ -288,5 +288,228 @@ router.post('/portal-session', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+// ============================================
+// 9. CRIAR PAYMENT LINK PARA VENDA (NOVO!)
+// ============================================
+router.post('/create-payment-link', async (req, res) => {
+    try {
+        const { pedidoId, valorTotal, clienteEmail, clienteNome, produtos } = req.body;
+        
+        // Validação
+        if (!pedidoId || !valorTotal || !produtos || produtos.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Dados incompletos'
+            });
+        }
+        
+        console.log(`📦 Criando Payment Link para pedido: ${pedidoId}`);
+        
+        // 1. Criar line items
+        const lineItems = [];
+        
+        for (const produto of produtos) {
+            // Criar Price no Stripe para cada produto
+            const price = await stripe.prices.create({
+                currency: 'brl',
+                unit_amount: Math.round(produto.preco * 100), // Centavos
+                product_data: {
+                    name: produto.nome,
+                    metadata: {
+                        pedido_id: pedidoId,
+                        quantidade: produto.quantidade.toString()
+                    }
+                },
+            });
+            
+            lineItems.push({
+                price: price.id,
+                quantity: produto.quantidade
+            });
+        }
+        
+        // 2. Criar Payment Link
+        const paymentLink = await stripe.paymentLinks.create({
+            line_items: lineItems,
+            metadata: {
+                pedido_id: pedidoId,
+                cliente_email: clienteEmail || 'cliente@email.com',
+                cliente_nome: clienteNome || 'Cliente'
+            },
+            after_completion: {
+                type: 'redirect',
+                redirect: {
+                    url: `${process.env.FRONTEND_URL}/pagamento/sucesso?pedido=${pedidoId}`
+                }
+            },
+            // Permitir ajuste de quantidade
+            allow_promotion_codes: true,
+        });
+        
+        console.log(`✅ Payment Link criado: ${paymentLink.url}`);
+        
+        // 3. Retornar link
+        return res.json({
+            success: true,
+            paymentLink: paymentLink.url,
+            paymentLinkId: paymentLink.id,
+            pedidoId: pedidoId
+        });
+        
+    } catch (error) {
+        console.error('❌ Erro ao criar Payment Link:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================
+// 10. VERIFICAR STATUS DE PAGAMENTO (NOVO!)
+// ============================================
+router.get('/payment-status/:pedidoId', async (req, res) => {
+    try {
+        const { pedidoId } = req.params;
+        
+        // Buscar pedido no Supabase
+        const { data: pedido, error } = await supabase
+            .from('pedidos')
+            .select('status_pagamento, stripe_payment_link')
+            .eq('id', pedidoId)
+            .single();
+        
+        if (error || !pedido) {
+            return res.status(404).json({
+                success: false,
+                error: 'Pedido não encontrado'
+            });
+        }
+        
+        // Se já está pago, retornar direto
+        if (pedido.status_pagamento === 'pago') {
+            return res.json({
+                success: true,
+                status: 'paid',
+                message: 'Pagamento confirmado'
+            });
+        }
+        
+        // Buscar PaymentIntent relacionado ao pedido
+        const paymentIntents = await stripe.paymentIntents.search({
+            query: `metadata['pedido_id']:'${pedidoId}'`,
+            limit: 1
+        });
+        
+        if (paymentIntents.data.length === 0) {
+            return res.json({
+                success: true,
+                status: 'pending',
+                message: 'Aguardando pagamento'
+            });
+        }
+        
+        const paymentIntent = paymentIntents.data[0];
+        
+        return res.json({
+            success: true,
+            status: paymentIntent.status,
+            amount: paymentIntent.amount / 100,
+            currency: paymentIntent.currency
+        });
+        
+    } catch (error) {
+        console.error('❌ Erro ao verificar status:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ============================================
+// 11. WEBHOOK PARA PAYMENT LINKS (NOVO!)
+// ============================================
+router.post('/webhook-payments', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET_PAYMENTS; // Criar novo secret
+    
+    let event;
+    
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    } catch (err) {
+        console.error('❌ Webhook signature verification failed:', err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+    
+    console.log(`📩 Webhook recebido: ${event.type}`);
+    
+    // Processar eventos
+    switch (event.type) {
+        case 'checkout.session.completed':
+            const session = event.data.object;
+            const pedidoId = session.metadata.pedido_id;
+            
+            console.log(`✅ Pagamento confirmado para pedido: ${pedidoId}`);
+            
+            // Atualizar pedido no Supabase
+            await supabase
+                .from('pedidos')
+                .update({
+                    status_pagamento: 'pago',
+                    status_separacao: 'Pronto para pagamento',
+                    ultima_atualizacao: new Date().toISOString()
+                })
+                .eq('id', pedidoId);
+            
+            // TODO: Enviar notificação para lojista
+            // TODO: Criar notificação no sistema
+            
+            break;
+            
+        case 'payment_intent.succeeded':
+            const paymentIntent = event.data.object;
+            const pedidoIdSuccess = paymentIntent.metadata.pedido_id;
+            
+            if (pedidoIdSuccess) {
+                console.log(`✅ PaymentIntent succeeded: ${pedidoIdSuccess}`);
+                
+                await supabase
+                    .from('pedidos')
+                    .update({
+                        status_pagamento: 'pago',
+                        status_separacao: 'Pronto para pagamento',
+                        ultima_atualizacao: new Date().toISOString()
+                    })
+                    .eq('id', pedidoIdSuccess);
+            }
+            
+            break;
+            
+        case 'payment_intent.payment_failed':
+            const failedIntent = event.data.object;
+            const pedidoIdFailed = failedIntent.metadata.pedido_id;
+            
+            console.log(`❌ Pagamento falhou: ${pedidoIdFailed}`);
+            
+            if (pedidoIdFailed) {
+                await supabase
+                    .from('pedidos')
+                    .update({
+                        status_pagamento: 'falhou',
+                        ultima_atualizacao: new Date().toISOString()
+                    })
+                    .eq('id', pedidoIdFailed);
+            }
+            
+            break;
+            
+        default:
+            console.log(`ℹ️ Evento não tratado: ${event.type}`);
+    }
+    
+    res.json({ received: true });
+});
 
 module.exports = router;
